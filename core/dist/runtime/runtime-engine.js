@@ -1,0 +1,221 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const { fork } = require('node:child_process');
+const path = require('node:path');
+const { Worker } = require('node:worker_threads');
+const store = require('../models/store');
+const { updateRuntimeConfig } = require('../config/config');
+const { sendPushooMessage } = require('../services/push');
+const { createDataProvider } = require('./data-provider');
+const { createReloginReminderService } = require('./relogin-reminder');
+const { createQqBotPushService } = require('../services/qq-bot-push');
+const { createRuntimeState } = require('./runtime-state');
+const { createWorkerManager } = require('./worker-manager');
+const { listHostedSessions, findAccountSession } = require('../session/ipc');
+const OPERATION_KEYS = ['harvest', 'farming', 'fertilize', 'plant', 'steal', 'helpFarming', 'taskClaim', 'sell', 'upgrade'];
+function createRuntimeEngine(options = {}) {
+    const processRef = options.processRef || process;
+    // Detect if running from source (tsx) or compiled (node)
+    const isRunningFromSource = __dirname.includes(`${path.sep}src${path.sep}`);
+    const fileExt = isRunningFromSource ? '.ts' : '.js';
+    const mainEntryPath = options.mainEntryPath || path.join(__dirname, `../../client${fileExt}`);
+    const workerScriptPath = options.workerScriptPath || path.join(__dirname, `../core/worker${fileExt}`);
+    const runtimeMode = String(options.runtimeMode || processRef.env.FARM_RUNTIME_MODE || 'thread').toLowerCase();
+    const onStatusSync = typeof options.onStatusSync === 'function' ? options.onStatusSync : null;
+    const onLog = typeof options.onLog === 'function' ? options.onLog : null;
+    const onAccountLog = typeof options.onAccountLog === 'function' ? options.onAccountLog : null;
+    const startAdminServer = typeof options.startAdminServer === 'function' ? options.startAdminServer : null;
+    const runtimeState = createRuntimeState({
+        store,
+        operationKeys: OPERATION_KEYS,
+    });
+    const { workers, globalLogs: GLOBAL_LOGS, accountLogs: ACCOUNT_LOGS, runtimeEvents, nextConfigRevision, buildConfigSnapshotForAccount, log, addAccountLog, normalizeStatusForPanel, buildDefaultStatus, filterLogs, } = runtimeState;
+    const reloginReminder = createReloginReminderService({
+        store,
+        sendPushooMessage,
+        log,
+    });
+    const { getOfflineAutoDeleteMs, triggerOfflineReminder, sendConfiguredPush, } = reloginReminder;
+    // QQ 机器人单聊推送（重要日志）：独立于 pushoo 渠道，掉线提醒与事件动态都走这里
+    const qqBotPush = createQqBotPushService({
+        store,
+        log,
+        // 扫码重新登录后：用新 code 更新账号并重启上线。
+        // dataProvider 在下方才创建，这里靠闭包延迟引用。
+        getAccount: (accountId) => {
+            const accounts = store.getAccounts();
+            return (accounts.accounts || []).find((a) => String(a.id) === String(accountId)) || null;
+        },
+        reloginAccount: async (accountId, patch) => {
+            try {
+                store.addOrUpdateAccount({ id: String(accountId), ...(patch || {}) });
+                return !!(dataProvider && await dataProvider.restartAccount(accountId));
+            }
+            catch (e) {
+                log('QQ机器人', `扫码后更新账号失败: ${e.message}`);
+                return false;
+            }
+        },
+    });
+    // 下线提醒同时下发给 pushoo 渠道与 QQ 机器人
+    function triggerOfflineReminderWithQqBot(payload) {
+        triggerOfflineReminder(payload);
+        try {
+            qqBotPush.sendOfflineNotification(payload);
+        }
+        catch { }
+    }
+    const { startWorker, stopWorker, restartWorker, callWorkerApi, startAccountWorker, stopAccountWorker, detachAllWorkers } = createWorkerManager({
+        fork,
+        WorkerThread: Worker,
+        runtimeMode,
+        processRef,
+        mainEntryPath,
+        workerScriptPath,
+        workers,
+        globalLogs: GLOBAL_LOGS,
+        log,
+        addAccountLog,
+        normalizeStatusForPanel,
+        buildConfigSnapshotForAccount,
+        getOfflineAutoDeleteMs,
+        triggerOfflineReminder: triggerOfflineReminderWithQqBot,
+        sendConfiguredPush,
+        addOrUpdateAccount: store.addOrUpdateAccount,
+        deleteAccount: store.deleteAccount,
+        onStatusSync: (accountId, status, accountName) => {
+            runtimeEvents.emit('status', { accountId, status, accountName });
+            if (onStatusSync)
+                onStatusSync(accountId, status, accountName);
+        },
+        onWorkerLog: (entry, accountId, accountName) => {
+            runtimeEvents.emit('worker_log', { entry, accountId, accountName });
+            if (onLog)
+                onLog(entry, accountId, accountName);
+            try {
+                qqBotPush.enqueueLog(entry, accountName, accountId);
+            }
+            catch { }
+        },
+    });
+    const dataProvider = createDataProvider({
+        workers,
+        globalLogs: GLOBAL_LOGS,
+        accountLogs: ACCOUNT_LOGS,
+        store,
+        getAccounts: store.getAccounts,
+        callWorkerApi,
+        buildDefaultStatus,
+        normalizeStatusForPanel,
+        filterLogs,
+        addAccountLog,
+        nextConfigRevision,
+        broadcastConfigToWorkers,
+        buildConfigSnapshotForAccount,
+        broadcastGameConfigReload,
+        startWorker: startAccountWorker,
+        stopWorker: stopAccountWorker,
+        restartWorker,
+    });
+    runtimeEvents.on('log', (entry) => {
+        if (onLog)
+            onLog(entry, entry && entry.accountId ? entry.accountId : '', entry && entry.accountName ? entry.accountName : '');
+    });
+    runtimeEvents.on('account_log', (entry) => {
+        if (onAccountLog)
+            onAccountLog(entry);
+    });
+    function broadcastConfigToWorkers(targetAccountId = '') {
+        const targetId = String(targetAccountId || '').trim();
+        for (const [accId, worker] of Object.entries(workers)) {
+            if (targetId && String(accId) !== targetId)
+                continue;
+            const snapshot = buildConfigSnapshotForAccount(accId);
+            try {
+                worker.process.send({ type: 'config_sync', config: snapshot });
+            }
+            catch {
+                // ignore IPC failures for exited workers
+            }
+        }
+    }
+    function broadcastGameConfigReload() {
+        for (const worker of Object.values(workers)) {
+            try {
+                worker.process.send({ type: 'reload_config' });
+            }
+            catch {
+                // ignore IPC failures for exited workers
+            }
+        }
+    }
+    function startAllAccounts() {
+        const accounts = (store.getAccounts().accounts || []);
+        if (accounts.length > 0) {
+            log('系统', `发现 ${accounts.length} 个账号，正在启动...`);
+            accounts.forEach((acc) => startWorker(acc));
+        }
+        else {
+            log('系统', '未发现账号，请访问管理面板添加账号');
+        }
+    }
+    async function start(options = {}) {
+        const shouldStartAdminServer = options.startAdminServer !== false;
+        const shouldAutoStartAccounts = options.autoStartAccounts !== false;
+        const savedSystemConfig = store.getSystemConfig();
+        if (savedSystemConfig) {
+            updateRuntimeConfig(savedSystemConfig);
+            log('系统', `已加载系统配置: serverUrl=${savedSystemConfig.serverUrl}, clientVersion=${savedSystemConfig.clientVersion}, platform=${savedSystemConfig.platform}`);
+        }
+        if (shouldStartAdminServer && startAdminServer) {
+            startAdminServer(dataProvider);
+        }
+        try {
+            qqBotPush.start();
+        }
+        catch { }
+        if (processRef.env.FARM_SESSION_SOCKET) {
+            const sessions = await listHostedSessions();
+            for (const account of store.getAccounts().accounts) {
+                const session = findAccountSession(sessions, account);
+                if (session || shouldAutoStartAccounts)
+                    startWorker(account, session?.sessionId);
+            }
+        }
+        else if (shouldAutoStartAccounts) {
+            startAllAccounts();
+        }
+    }
+    function stopAllAccounts() {
+        for (const accountId of Object.keys(workers)) {
+            stopWorker(accountId);
+        }
+        try {
+            qqBotPush.stop();
+        }
+        catch { }
+    }
+    return {
+        store,
+        runtimeEvents,
+        workers,
+        dataProvider,
+        qqBotPush,
+        start,
+        startAllAccounts,
+        stopAllAccounts,
+        detachAllWorkers,
+        broadcastConfigToWorkers,
+        broadcastGameConfigReload,
+        startWorker,
+        stopWorker,
+        restartWorker,
+        callWorkerApi,
+        log,
+        addAccountLog,
+    };
+}
+module.exports = {
+    createRuntimeEngine,
+};
+//# sourceMappingURL=runtime-engine.js.map
